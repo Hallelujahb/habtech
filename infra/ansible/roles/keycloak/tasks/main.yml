@@ -1,0 +1,20 @@
+---
+- name: Run Keycloak container
+  docker_container:
+    name: keycloak
+    image: "quay.io/keycloak/keycloak:latest"
+    state: started
+    restart_policy: unless-stopped
+    command: "start-dev"
+    ports:
+      - "8180:8080"
+    env:
+      KEYCLOAK_ADMIN: "username"
+      KEYCLOAK_ADMIN_PASSWORD: "{{ vault_keycloak_admin_password | default('change_me') }}"
+    volumes:
+      # bare-metal note: mount a real volume for Keycloak's data store,
+      # unlike the demo setup -- this is exactly the gap that caused
+      # realm/client data to vanish after the crash-restart earlier,
+      # since start-dev's embedded store wasn't pointed at a persisted
+      # path in the original docker run command.
+      - "nhdw_keycloak_data:/opt/keycloak/data"

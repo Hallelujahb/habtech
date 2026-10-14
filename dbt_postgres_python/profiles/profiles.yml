@@ -1,0 +1,20 @@
+# two targets: "postgres" is the normal dbt-postgres connection (same
+# credentials as dbt_postgres/profiles/profiles.yml), "python" is the
+# dbt-postgres-python (fal-style) target that actually runs .py models --
+# it points at db_profile: postgres for where to read/write, and just
+# handles the "run this as a Python process instead of SQL" part.
+nhdw_demo_python:
+  target: python
+  outputs:
+    postgres:
+      type: postgres
+      host: localhost
+      user: postgres
+      password: password
+      port: 5432
+      dbname: postgres
+      schema: public
+      threads: 4
+    python:
+      type: fal
+      db_profile: postgres

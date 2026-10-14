@@ -1,0 +1,387 @@
+# nhdw demo — real facility data, commands top to bottom
+#
+# this is the whole pipeline, nothing outside it. everything lives at
+# ~/habtech. run habtech_setup.sh once first, then this file, in order.
+# credentials for everything: username/password, postgres user is
+# "postgres" (see CREDENTIALS.md).
+#
+# steps 1-9 are the original ingest -> dbt -> spark -> minio -> clickhouse
+# -> LLM-linking -> monitoring pipeline. steps 10-13 are the newer
+# additions (dbt Python models, Kafka/Debezium CDC, Superset, Keycloak
+# across all of it) -- each of those points at its own longer doc rather
+# than being fully inlined here, since each is a multi-container setup of
+# its own. step 14 is the infra-as-code layer (Helm/Kubernetes, Ansible,
+# Airflow, GitHub Actions) -- validated/lint-passing artifacts, not a
+# live deployment; see NHDW_Complete_System_Overview.pdf section 4 and
+# DEMO.md for how to present that distinction honestly.
+#
+# the datasets, all real, all explained in DATASETS_EXPLAINED.txt:
+#   - master_facility_registry.csv   1,332 rows  (Master Facility Registry)
+#   - org_units.csv                    492 rows  (DHIS2 org unit hierarchy)
+#   - facility_linkage_unresolved.csv  152 rows  (org units with no MFR match)
+#   - dhis2_manual_registry_fafan.csv  461 rows  (manual regional bureau list,
+#                                                  used for LLM name matching)
+#
+# copy the habtech folder to ~/habtech before starting.
+
+export HABTECH_HOME=~/habtech
+
+# ---------------------------------------------------------------------
+# step 1, containers — everything the pipeline sits on top of
+# ---------------------------------------------------------------------
+# every container below has --restart unless-stopped, so once it's up
+# once, it survives a reboot on its own -- Docker's daemon restarts it
+# automatically, as long as the Docker daemon itself starts on boot
+# (habtech_setup.sh runs `systemctl enable docker` for exactly this).
+#
+# IMPORTANT, the actual boundary: --restart makes a STOPPED container
+# come back, with its data intact. it does NOT protect against re-running
+# this block, which starts with `docker rm -f` -- that deletes the
+# containers outright, wiping whatever was inside (ingested tables, dbt
+# models, everything from steps 2-9). rule of thumb: after the first
+# real setup, don't rerun this block again unless you actually want a
+# clean slate. if a container just stopped (crashed, machine slept,
+# `docker logs <name>` shows nothing alarming), `docker start <name>`
+# brings it back with data intact -- that's the normal recovery path,
+# not rerunning step 1.
+
+sudo docker rm -f pg clickhouse minio keycloak prometheus grafana cadvisor 2>/dev/null
+
+sudo docker run --name pg --restart unless-stopped -e POSTGRES_PASSWORD=password -p 5432:5432 -d postgres:16
+sudo docker run -d --name clickhouse --restart unless-stopped -p 8123:8123 -p 9363:9363 \
+  -e CLICKHOUSE_USER=username -e CLICKHOUSE_PASSWORD=password -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+  -v ~/habtech/monitoring/clickhouse_prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml \
+  clickhouse/clickhouse-server
+sudo docker run -d --name minio --restart unless-stopped -p 9000:9000 -p 9001:9001 -e "MINIO_ROOT_USER=username" -e "MINIO_ROOT_PASSWORD=password" -e "MINIO_PROMETHEUS_AUTH_TYPE=public" minio/minio server /data --console-address ":9001"
+sleep 8
+
+sudo docker run -d --name keycloak --restart unless-stopped -p 8180:8080 -p 9002:9000 --add-host=host.docker.internal:host-gateway -e KEYCLOAK_ADMIN=username -e KEYCLOAK_ADMIN_PASSWORD=password quay.io/keycloak/keycloak:latest start-dev --metrics-enabled=true
+sleep 45
+# login is username / password. this brings Keycloak up standalone --
+# wiring it into Grafana, MinIO, and gateways in front of Postgres/
+# ClickHouse's web UIs is its own step, see KEYCLOAK_SSO_SETUP.md
+# (needs Keycloak up first, run it any time after this point)
+
+sudo docker run \
+  --volume=/:/rootfs:ro --volume=/var/run:/var/run:ro --volume=/sys:/sys:ro \
+  --volume=/var/lib/docker/:/var/lib/docker:ro --volume=/dev/disk/:/dev/disk:ro \
+  --publish=8085:8080 --detach=true --restart unless-stopped --name=cadvisor gcr.io/cadvisor/cadvisor:latest
+
+sudo docker run -d --name prometheus --restart unless-stopped -p 9090:9090 \
+  --add-host=host.docker.internal:host-gateway \
+  -v ~/habtech/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml \
+  prom/prometheus
+sleep 5
+# confirm two targets at http://localhost:9090/targets, both green,
+# before moving on — that's the actual proof monitoring is watching
+
+sudo docker run -d --name grafana --restart unless-stopped -p 3000:3000 \
+  --add-host=host.docker.internal:host-gateway \
+  -e GF_SECURITY_ADMIN_USER=username -e GF_SECURITY_ADMIN_PASSWORD=password \
+  grafana/grafana
+sleep 15
+# http://localhost:3000, login username / password
+
+sudo docker exec -it minio mc alias set localminio http://localhost:9000 username password 2>/dev/null || true
+python3 ~/habtech/lakehouse/setup_minio_buckets.py
+
+# ---------------------------------------------------------------------
+# step 2, data cleaning — real transformations, run BEFORE ingestion
+# ---------------------------------------------------------------------
+# cleaning has to happen before the join, not after: a join is only as
+# good as the keys and names going into it. this script trims whitespace,
+# fixes lowercase-leading facility names, normalizes zone naming so it can
+# be matched by name (org_units says "Fafan Zone", mfr says "Fafan"),
+# validates coordinates against Ethiopia's real bounding box, converts
+# year_opened from the Ethiopian calendar to a Gregorian year, and flags
+# which beds/rooms fields were actually reported vs silently blank.
+# every number below is real, printed by the script itself.
+
+cd ~/habtech/data_cleaning
+python3 clean_facility_data.py
+cat ../DATA_CLEANING_LOG.md
+
+# ---------------------------------------------------------------------
+# step 3, meltano ingestion — the cleaned files
+# ---------------------------------------------------------------------
+
+cd ~/habtech/meltano_project
+meltano config set tap-csv files '[
+  {"entity": "mfr_facilities", "path": "'"$HOME"'/habtech/data_v2/master_facility_registry_clean.csv", "keys": ["id"]},
+  {"entity": "org_units", "path": "'"$HOME"'/habtech/data_v2/org_units_clean.csv", "keys": ["id"]},
+  {"entity": "facility_linkage_unresolved", "path": "'"$HOME"'/habtech/data_v2/facility_linkage_unresolved.csv", "keys": ["id"]}
+]'
+
+meltano config set target-postgres host localhost
+meltano config set target-postgres port 5432
+meltano config set target-postgres user postgres
+meltano config set target-postgres password password
+meltano config set target-postgres database postgres
+meltano config set target-postgres default_target_schema public
+
+time meltano run tap-csv target-postgres
+
+# confirm the three real tables landed
+sudo docker exec -it pg psql -U postgres -c "\dt"
+sudo docker exec -it pg psql -U postgres -c "SELECT count(*) FROM mfr_facilities;"
+sudo docker exec -it pg psql -U postgres -c "SELECT count(*) FROM org_units;"
+
+# ---------------------------------------------------------------------
+# step 4, dbt — star schema on postgres
+# ---------------------------------------------------------------------
+# models: stg_mfr_facilities, stg_org_units, dim_facility, dim_geography,
+# fact_facility_infrastructure, fact_linkage_audit
+
+cd ~/habtech/dbt_postgres
+~/habtech/dbt_venv/bin/dbt run --profiles-dir profiles
+~/habtech/dbt_venv/bin/dbt test --profiles-dir profiles
+
+# the one number to read out loud in the demo: the linkage match rate
+sudo docker exec -it pg psql -U postgres -c "SELECT * FROM fact_linkage_audit;"
+
+# ---------------------------------------------------------------------
+# step 5, spark — same join, done a second way, for the spark-vs-dbt comparison
+# ---------------------------------------------------------------------
+
+cd ~/habtech/spark
+python3 spark_link_compare.py
+
+# ---------------------------------------------------------------------
+# step 6, minio — confirm the lakehouse zones actually got written
+# ---------------------------------------------------------------------
+# the `localminio` alias lives inside the minio container's own
+# filesystem -- if minio was ever recreated (e.g. for the Keycloak SSO
+# step), that alias is gone too and needs setting again, or every `mc`
+# command below will wrongly look like the data itself is missing.
+
+sudo docker exec -it minio mc alias set localminio http://localhost:9000 username password
+sudo docker exec -it minio mc ls localminio/bronze-zone/facility_linkage/
+sudo docker exec -it minio mc ls localminio/silver-zone/facility_linkage_unresolved/
+sudo docker exec -it minio mc ls localminio/gold-zone/facility_linkage_summary/
+
+# ---------------------------------------------------------------------
+# step 7, clickhouse — load the mfr rollup for fast Superset queries
+# ---------------------------------------------------------------------
+
+sudo docker cp ~/habtech/data_v2/master_facility_registry_clean.csv clickhouse:/tmp/mfr.csv
+sudo docker exec -it clickhouse clickhouse-client --user username --password password --query "
+CREATE TABLE IF NOT EXISTS default.mfr_facilities_ch (
+    id UInt64, name String, type String, subtype String, ownership String,
+    status String, operational_status String, region String, zone String,
+    woreda String, city String, kebele String, latitude Nullable(Float64),
+    longitude Nullable(Float64), altitude Nullable(Float64), dhis2_id String,
+    ethiopian_national_facility_id String, catchment_population Nullable(UInt32),
+    number_of_inpatient_beds UInt32, number_of_maternity_beds UInt32,
+    number_of_emergency_beds UInt32, number_of_opd_rooms UInt32,
+    number_of_ipd_rooms UInt32, number_of_laboratory_rooms UInt32,
+    number_of_imaging_rooms UInt32, number_of_mch_rooms UInt32,
+    number_of_icu_rooms UInt32, year_opened String, zone_normalized String,
+    year_opened_gregorian Nullable(UInt16), beds_reported UInt8
+) ENGINE = MergeTree ORDER BY id"
+
+sudo docker exec -i clickhouse clickhouse-client --user username --password password --query "
+INSERT INTO default.mfr_facilities_ch FORMAT CSVWithNames" < ~/habtech/data_v2/master_facility_registry_clean.csv
+
+cd ~/habtech/dbt_clickhouse
+~/habtech/dbt_venv/bin/dbt run --profiles-dir profiles
+
+sudo docker exec -it clickhouse clickhouse-client --user username --password password --query "SELECT * FROM default.fact_facility_ch ORDER BY facility_count DESC LIMIT 10"
+
+# ---------------------------------------------------------------------
+# step 8, LLM-assisted linking — the part a plain join cannot do
+# ---------------------------------------------------------------------
+# the deterministic join in step 3/4 resolves ~69% of org units (340/492).
+# the rest have no shared id, only a name. this step asks an LLM to judge
+# name matches against the manually maintained regional registry. only a
+# facility name and region ever get sent anywhere — see
+# DATA_GOVERNANCE_NOTE.md for exactly what does and doesn't leave this
+# machine and why that's the case.
+#
+# two options, same script logic, same prompt, pick one:
+
+# option A: Gemini, hosted, needs an API key, generally the more reliable
+# judgment call on borderline name matches
+export GEMINI_API_KEY=your_key_here
+cd ~/habtech/llm_examples
+python3 llm_facility_matching.py
+
+# option B: Ollama, fully local, no API key, nothing leaves this machine
+# at all -- github.com/ollama/ollama, open source. noticeably less
+# reliable on borderline cases with a small model, that tradeoff is real
+# and worth saying out loud if this is the one used in the room
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull llama3.2
+cd ~/habtech/llm_examples
+python3 llm_facility_matching_local.py
+
+# option C, the actual recommended one: LinkTransformer -- a record-linkage
+# library, not a general chat LLM. local, no API key, no rate limit, gives
+# a numeric similarity score instead of a free-text verdict to parse. see
+# LINKING_LIBRARY_COMPARISON.md for why this is the one to lead with in
+# the room over A/B above.
+cd ~/habtech/linktransformer_examples
+python3 linktransformer_facility_matching.py
+python3 linktransformer_dedup_registry.py
+
+# ---------------------------------------------------------------------
+# step 9, monitoring — confirm it's watching the containers that now
+# hold real data
+# ---------------------------------------------------------------------
+# by default this covers container-level health for everything (cadvisor).
+# for real application-level metrics too -- Postgres query stats,
+# ClickHouse query stats, MinIO usage, Keycloak logins -- see
+# PROMETHEUS_GRAFANA_MONITORING.md, which also has the actual
+# down-detection demo (stop a container live, watch the graph react).
+
+curl -s http://localhost:9090/api/v1/query?query=up | python3 -m json.tool | head -30
+# open http://localhost:3000 (Grafana) and confirm the pg/clickhouse/minio
+# panels are showing recent activity from the steps above
+
+# ---------------------------------------------------------------------
+# step 10, dbt Python models -- the linkage scoring step as a real dbt
+# model, not just a standalone script
+# ---------------------------------------------------------------------
+# see DBT_PYTHON_MODELS_NOTE.md first -- this only works on Postgres
+# (via the dbt-postgres-python/fal adapter), NOT on ClickHouse, which has
+# no dbt Python model support at all. the ClickHouse equivalent is a
+# plain script, run separately, step 10b below.
+#
+# optional step -- only run this if habtech_setup.sh reported
+# "dbt-postgres-python installed OK" (needs python3.10/3.11, a separate
+# venv from the rest of dbt -- see habtech_setup.sh for why). if it
+# reported the package unavailable, skip step 10 entirely; steps 1-9
+# are unaffected either way.
+#
+# TWO commands, TWO different venvs, in this order -- not one dbt run:
+#   1. export_scored_matches.py runs LinkTransformer (needs pandas>=2.0)
+#      and writes its output to a CSV.
+#   2. dbt run reads that CSV (needs pandas<2.0, dbt_python_venv).
+# these can't be merged into one step: dbt-postgres-python requires
+# pandas<2.0 and LinkTransformer requires pandas>=2.0 -- genuinely
+# incompatible in one Python process, on any Python version. see the
+# comment at the top of dbt_postgres_python/models/fact_linkage_scored.py
+# for the full explanation.
+
+cd ~/habtech/linktransformer_examples
+python3 export_scored_matches.py
+
+cd ~/habtech/dbt_postgres_python
+~/habtech/dbt_python_venv/bin/dbt run --profiles-dir profiles
+sudo docker exec -it pg psql -U postgres -c "SELECT * FROM fact_linkage_scored ORDER BY similarity_score DESC LIMIT 10;"
+
+# step 10b, the ClickHouse side -- a standalone python script, not dbt,
+# because dbt-clickhouse doesn't support Python models (see the note above)
+cd ~/habtech/dbt_clickhouse_python
+python3 build_fact_facility_ch.py
+
+# ---------------------------------------------------------------------
+# step 11, Kafka + Debezium -- change data capture on Postgres
+# ---------------------------------------------------------------------
+# full walkthrough, including the required Postgres recreation
+# (wal_level=logical) and the live "edit a row, watch it appear on the
+# topic" demo moment, is in kafka_cdc/KAFKA_DEBEZIUM_SETUP.md -- longer
+# than fits cleanly here, follow that file steps 0 through 6 in order,
+# then come back here.
+
+# after that file's step 5, the CDC-fed ClickHouse table is queryable
+# the same as any other:
+sudo docker exec -it clickhouse clickhouse-client --user username --password password --query \
+  "SELECT * FROM default.mfr_facilities_cdc ORDER BY updated_at DESC LIMIT 5"
+
+# ---------------------------------------------------------------------
+# step 12, Apache Superset -- dashboards on top of both warehouses
+# ---------------------------------------------------------------------
+# full walkthrough (Keycloak client, container, connecting both
+# databases) is in superset/SUPERSET_SETUP.md, same "too long to inline
+# here" reasoning as step 11.
+
+# ---------------------------------------------------------------------
+# step 13, Keycloak SSO across everything above
+# ---------------------------------------------------------------------
+# KEYCLOAK_SSO_SETUP.md covers all of it now: Grafana, MinIO, Superset,
+# and Kafka UI natively; Postgres, ClickHouse, and Kafka Connect's REST
+# API behind oauth2-proxy gateways; and an honest section on the two
+# things that genuinely don't get a Keycloak login (the Kafka broker's
+# own client protocol, and Meltano, which has no web UI at all as of
+# v3.0 to put a login in front of).
+
+# ---------------------------------------------------------------------
+# step 14, infra-as-code layer -- Helm, Ansible, Airflow, GitHub Actions
+# ---------------------------------------------------------------------
+# NONE of steps 1-13 above touch this layer -- it runs standalone,
+# validated, no live cluster / no live server / no live scheduler
+# behind it yet. that's the honest line, and it's fine to say so in
+# the room: these commands PROVE the artifacts are real and correct,
+# they don't claim a live deployment. see NHDW_Complete_System_Overview.pdf
+# section 4 for the full real-vs-not table.
+
+cd ~/habtech/infra
+
+# --- 14a. Helm chart -- lint + render, no cluster required ---
+# helm lint catches template errors, missing required values, bad
+# chart structure. helm template renders the FULL Kubernetes YAML
+# that a real cluster would apply -- this is the thing to paste on
+# screen: "here is the exact manifest Kubernetes would run."
+helm lint helm/nhdw-chart
+
+helm template nhdw-demo helm/nhdw-chart \
+  --set postgres.credentials.password=demopass \
+  --set clickhouse.credentials.password=demopass \
+  --set minio.rootPassword=demopass \
+  --set monitoring.grafana.adminPassword=demopass \
+  | less
+
+# --dry-run against a REAL cluster (minikube/kind/k3d), if one is
+# available in the room -- this actually contacts the API server and
+# validates the manifests server-side, one level more real than
+# `helm template` alone, still without creating anything
+# minikube start   # only if you want to go this far live
+helm install nhdw-demo helm/nhdw-chart --dry-run --debug \
+  --set postgres.credentials.password=demopass \
+  --set clickhouse.credentials.password=demopass \
+  --set minio.rootPassword=demopass
+
+# --- 14b. Ansible playbook -- syntax + a real local dry run ---
+cd ~/habtech/infra/ansible
+ansible-playbook site.yml --syntax-check
+
+# --check does a real connection + real module logic against a target,
+# reporting what WOULD change, without changing anything -- point this
+# at localhost to prove it end-to-end without a remote server:
+ansible-playbook site.yml -i "localhost," -c local --check --diff
+
+# --- 14c. Airflow DAG -- import validation, no scheduler required ---
+cd ~/habtech/infra/airflow
+python3 -c "
+import ast
+ast.parse(open('dags/nhdw_pipeline_dag.py').read())
+print('DAG file: valid Python syntax')
+"
+# if a real Airflow install is available in the room, this is the
+# actual "does Airflow accept it" check:
+# export AIRFLOW_HOME=~/airflow
+# airflow dags list-import-errors
+# airflow dags show nhdw_pipeline   # prints/renders the dependency graph
+
+# --- 14d. GitHub Actions workflow -- YAML validity + local dry run ---
+cd ~/habtech
+python3 -c "
+import yaml
+yaml.safe_load(open('.github/workflows/nhdw_ci.yml'))
+print('nhdw_ci.yml: valid workflow YAML')
+"
+# actionlint (https://github.com/rhysd/actionlint) catches GitHub
+# Actions-specific mistakes plain YAML validation misses -- run it if
+# installed:
+# actionlint .github/workflows/nhdw_ci.yml
+
+# act (https://github.com/nektos/act) runs the workflow locally in
+# Docker, no push required -- the closest thing to a live CI demo
+# without touching the real repo:
+# act push -W .github/workflows/nhdw_ci.yml
+
+# the actual proof this already works: push a small change to
+# dbt_postgres/models/ or meltano_project/ and show the checkmark
+# appear on the commit in GitHub's UI -- that's a real, already-wired
+# trigger, no simulation needed if the repo is on GitHub.
+

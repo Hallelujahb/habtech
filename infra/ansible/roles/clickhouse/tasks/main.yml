@@ -1,0 +1,22 @@
+---
+- name: Copy prometheus config for ClickHouse
+  copy:
+    src: files/clickhouse_prometheus.xml
+    dest: /opt/nhdw/clickhouse_prometheus.xml
+
+- name: Run ClickHouse container
+  docker_container:
+    name: clickhouse
+    image: "clickhouse/clickhouse-server:latest"
+    state: started
+    restart_policy: unless-stopped
+    ports:
+      - "8123:8123"
+      - "9363:9363"
+    env:
+      CLICKHOUSE_USER: "username"
+      CLICKHOUSE_PASSWORD: "{{ clickhouse_password }}"
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - "/opt/nhdw/clickhouse_prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml"
+      - "nhdw_clickhouse_data:/var/lib/clickhouse"

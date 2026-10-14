@@ -1,0 +1,20 @@
+# Scheduling note: this is the Kubernetes-native answer to "how far can
+# scheduling go" for the transform layer specifically -- Airflow (see
+# the airflow/ directory) owns cross-tool orchestration and retries;
+# this CronJob is the simpler fallback for a single scheduled step if
+# Airflow isn't in the picture yet.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-dbt-run
+spec:
+  schedule: "0 */6 * * *"   # every 6 hours; change to match real ingestion cadence
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: dbt-run
+              image: ghcr.io/nhdw/dbt-runner:latest   # build from dbt_venv + dbt_postgres/, see doc
+              command: ["dbt", "run", "--profiles-dir", "/app/profiles"]
+          restartPolicy: OnFailure

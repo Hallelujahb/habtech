@@ -1,0 +1,11 @@
+nhdw_clickhouse_demo:
+  target: dev
+  outputs:
+    dev:
+      type: clickhouse
+      schema: default
+      host: localhost
+      port: 8123
+      user: username
+      password: "password"
+      secure: false

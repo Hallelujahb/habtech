@@ -1,0 +1,13 @@
+<!-- mounted into the clickhouse container at
+     /etc/clickhouse-server/config.d/prometheus.xml, enables ClickHouse's
+     own built-in Prometheus endpoint (a real, documented ClickHouse
+     feature, not a bolted-on exporter) at :9363/metrics -->
+<clickhouse>
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+        <metrics>true</metrics>
+        <events>true</events>
+        <asynchronous_metrics>true</asynchronous_metrics>
+    </prometheus>
+</clickhouse>

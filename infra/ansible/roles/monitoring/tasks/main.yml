@@ -1,0 +1,44 @@
+---
+- name: Run cAdvisor
+  docker_container:
+    name: cadvisor
+    image: "gcr.io/cadvisor/cadvisor:latest"
+    state: started
+    restart_policy: unless-stopped
+    ports:
+      - "8085:8080"
+    volumes:
+      - "/:/rootfs:ro"
+      - "/var/run:/var/run:ro"
+      - "/sys:/sys:ro"
+      - "/var/lib/docker/:/var/lib/docker:ro"
+
+- name: Copy Prometheus config
+  copy:
+    src: files/prometheus.yml
+    dest: /opt/nhdw/prometheus.yml
+
+- name: Run Prometheus
+  docker_container:
+    name: prometheus
+    image: "prom/prometheus:latest"
+    state: started
+    restart_policy: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - "/opt/nhdw/prometheus.yml:/etc/prometheus/prometheus.yml"
+
+- name: Run Grafana
+  docker_container:
+    name: grafana
+    image: "grafana/grafana:latest"
+    state: started
+    restart_policy: unless-stopped
+    ports:
+      - "3000:3000"
+    env:
+      GF_SECURITY_ADMIN_USER: "username"
+      GF_SECURITY_ADMIN_PASSWORD: "{{ vault_grafana_admin_password | default('change_me') }}"
+    volumes:
+      - "nhdw_grafana_data:/var/lib/grafana"

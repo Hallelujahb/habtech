@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  - name: dim_facility
+    columns:
+      - name: facility_id
+        tests:
+          - not_null
+          - unique
+
+  - name: fact_facility_infrastructure
+    columns:
+      - name: facility_id
+        tests:
+          - not_null
+      - name: total_beds
+        tests:
+          - not_null
+
+  - name: fact_linkage_audit
+    columns:
+      - name: total_org_units
+        tests:
+          - not_null

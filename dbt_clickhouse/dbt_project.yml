@@ -1,0 +1,8 @@
+name: 'nhdw_clickhouse_demo'
+version: '1.0.0'
+config-version: 2
+profile: 'nhdw_clickhouse_demo'
+model-paths: ["models"]
+models:
+  nhdw_clickhouse_demo:
+    +materialized: table

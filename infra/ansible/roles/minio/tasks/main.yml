@@ -1,0 +1,23 @@
+---
+- name: Run MinIO container
+  docker_container:
+    name: minio
+    image: "minio/minio:latest"
+    state: started
+    restart_policy: unless-stopped
+    command: "server /data --console-address :9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    env:
+      MINIO_ROOT_USER: "username"
+      MINIO_ROOT_PASSWORD: "{{ minio_root_password }}"
+      MINIO_PROMETHEUS_AUTH_TYPE: "public"
+    volumes:
+      - "nhdw_minio_data:/data"
+
+- name: Create lakehouse buckets (bronze/silver/gold)
+  command: >
+    docker exec minio mc alias set localminio http://localhost:9000
+    username {{ minio_root_password }}
+  changed_when: false

@@ -1,0 +1,44 @@
+# scrape jobs, one per real metrics source in this stack. every job here
+# maps to a genuine, documented metrics endpoint -- either a tool's own
+# built-in Prometheus support (ClickHouse, MinIO, Keycloak, oauth2-proxy)
+# or a dedicated exporter (postgres_exporter). cadvisor is what makes
+# container-level oversight (cpu, memory, alive/dead) apply to every
+# single container in the stack automatically, including ones with no
+# metrics endpoint of their own.
+
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['host.docker.internal:8085']
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['host.docker.internal:9187']
+
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['host.docker.internal:9363']
+
+  - job_name: 'minio'
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: ['host.docker.internal:9000']
+
+  - job_name: 'keycloak'
+    static_configs:
+      - targets: ['host.docker.internal:9002']
+
+  - job_name: 'oauth2-proxy-postgres-gateway'
+    static_configs:
+      - targets: ['host.docker.internal:44181']
+
+  - job_name: 'oauth2-proxy-clickhouse-gateway'
+    static_configs:
+      - targets: ['host.docker.internal:44182']

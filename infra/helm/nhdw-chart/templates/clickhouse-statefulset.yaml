@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-clickhouse
+spec:
+  serviceName: {{ .Release.Name }}-clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nhdw-clickhouse
+  template:
+    metadata:
+      labels:
+        app: nhdw-clickhouse
+    spec:
+      containers:
+        - name: clickhouse
+          image: {{ .Values.clickhouse.image }}
+          ports:
+            - containerPort: 8123
+            - containerPort: 9363
+          env:
+            - name: CLICKHOUSE_USER
+              value: {{ .Values.clickhouse.credentials.user }}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-clickhouse-secret
+                  key: password
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          volumeMounts:
+            - name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+            - name: prometheus-config
+              mountPath: /etc/clickhouse-server/config.d/prometheus.xml
+              subPath: prometheus.xml
+      volumes:
+        - name: prometheus-config
+          configMap:
+            name: {{ .Release.Name }}-clickhouse-prometheus-config
+  volumeClaimTemplates:
+    - metadata:
+        name: clickhouse-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.clickhouse.storageSize }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-clickhouse
+spec:
+  selector:
+    app: nhdw-clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+    - name: metrics
+      port: 9363
+      targetPort: 9363

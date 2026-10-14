@@ -1,0 +1,73 @@
+name: NHDW pipeline CI
+
+# runs meltano + dbt on every push to main and on PRs -- this is the
+# "updates are also shown there" part: push a change to a dbt model or
+# a Meltano config, this fires automatically and either confirms the
+# pipeline still runs clean or fails the PR check.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "meltano_project/**"
+      - "dbt_postgres/**"
+      - "dbt_clickhouse/**"
+      - "data_cleaning/**"
+  pull_request:
+    branches: [main]
+
+jobs:
+  transform-and-test:
+    # NOTE: this pipeline needs Docker containers (Postgres, ClickHouse)
+    # running alongside the job. GitHub's hosted runners support Docker,
+    # but for anything that needs the full 14-tool stack (Kafka,
+    # Debezium, Keycloak, etc.) a self-hosted runner mirroring the real
+    # environment is the honest answer -- hosted runners are fine for
+    # the ingest+transform+test slice covered here.
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # matches the version this project's dbt_venv actually needs
+
+      - name: Install pipeline dependencies
+        run: |
+          pip install meltano dbt-postgres pandas
+
+      - name: Run data cleaning
+        run: python3 data_cleaning/clean_facility_data.py
+
+      - name: Run Meltano ingestion
+        working-directory: meltano_project
+        run: meltano run tap-csv target-postgres
+        env:
+          TARGET_POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+
+      - name: Run dbt models
+        working-directory: dbt_postgres
+        run: dbt run --profiles-dir profiles
+        env:
+          DBT_POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+
+      - name: Run dbt tests
+        working-directory: dbt_postgres
+        run: dbt test --profiles-dir profiles
+        env:
+          DBT_POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}

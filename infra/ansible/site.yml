@@ -1,0 +1,11 @@
+---
+- name: Deploy NHDW pipeline to bare-metal servers
+  hosts: nhdw_servers
+  become: true
+  roles:
+    - docker
+    - postgres
+    - clickhouse
+    - minio
+    - keycloak
+    - monitoring

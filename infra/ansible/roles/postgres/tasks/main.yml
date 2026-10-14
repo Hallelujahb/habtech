@@ -1,0 +1,24 @@
+---
+- name: Run Postgres container with logical replication (Debezium-ready)
+  docker_container:
+    name: pg
+    image: "postgres:16"
+    state: started
+    restart_policy: unless-stopped
+    ports:
+      - "5432:5432"
+    env:
+      POSTGRES_PASSWORD: "{{ postgres_password }}"
+    command: >
+      -c wal_level=logical
+      -c max_replication_slots=4
+      -c max_wal_senders=4
+    volumes:
+      - "nhdw_postgres_data:/var/lib/postgresql/data"
+
+- name: Wait for Postgres to accept connections
+  wait_for:
+    host: "127.0.0.1"
+    port: 5432
+    delay: 3
+    timeout: 30

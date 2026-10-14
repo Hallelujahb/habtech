@@ -1,0 +1,47 @@
+# One values file controls every environment (dev/staging/prod) --
+# this is the whole point of Helm over hand-written manifests: the same
+# chart deploys anywhere, only these values change.
+
+postgres:
+  image: postgres:16
+  storageSize: 10Gi
+  credentials:
+    user: postgres
+    # real deployments: pull from a Secret, never a plain value -- see
+    # the "secrets" section in the doc. This key exists so `helm install
+    # --set postgres.credentials.password=...` works for local testing.
+    password: ""
+
+clickhouse:
+  image: clickhouse/clickhouse-server:latest
+  storageSize: 20Gi
+  credentials:
+    user: username
+    password: ""
+
+minio:
+  image: minio/minio:latest
+  storageSize: 50Gi
+  rootUser: username
+  rootPassword: ""
+
+keycloak:
+  image: quay.io/keycloak/keycloak:latest
+  realm: nhdw
+
+monitoring:
+  prometheus:
+    enabled: true
+  grafana:
+    enabled: true
+    adminPassword: ""
+  cadvisor:
+    enabled: true
+
+# National vs Fafan-zone pilot -- one flag controls dataset scope so the
+# same chart backs both the demo deployment and a future full rollout.
+dataScope: fafan-zone   # fafan-zone | national
+
+ingress:
+  enabled: false
+  host: nhdw.example.org

@@ -1,0 +1,112 @@
+NHDW DEMO — DATASETS EXPLAINED
+================================
+Where each file came from, exactly what was done to it, and where it's used
+in the pipeline. Every file here came from your three uploads, nothing else:
+  - mfr_facilities_202607291153.csv           (59,917 rows, national)
+  - org_units_202607291153__1_.csv            (492 rows)
+  - dhis2_echis_mfr_facilities__1_.xlsx        (3 sheets: dhis2, echis, mfr)
+
+
+1. master_facility_registry.csv  (1,332 rows)
+----------------------------------------------
+SOURCE: mfr_facilities_202607291153.csv (the big 59,917-row national file)
+
+WHAT I DID: filtered to region == "Somali Region" AND zone == "Fafan" only.
+That's it — no rows edited, no values changed. Just cut down from national
+scale to one zone so the whole demo stays small enough to move around and
+run fast. Also dropped columns you weren't using (official_phone_number,
+facility_owners_name, referral_linkage, reports_to, created_at_text,
+_sdc_extracted_at) and kept the rest as-is.
+
+WHERE IT'S USED:
+  - Meltano tap-csv entity "mfr_facilities" -> lands in Postgres
+  - dbt model stg_mfr_facilities.sql (staging/cleanup)
+  - dbt model dim_facility.sql (facility dimension)
+  - dbt model fact_facility_infrastructure.sql (the fact table — beds, rooms,
+    catchment population, one row per facility)
+  - spark_link_compare.py (left side of the join)
+  - ClickHouse table mfr_facilities_ch (loaded raw for the OLAP rollup)
+
+
+2. org_units.csv  (492 rows)
+-----------------------------
+SOURCE: org_units_202607291153__1_.csv, used whole, unfiltered.
+
+WHAT I DID: nothing — this file was already scoped to Fafan Zone by whoever
+exported it, and already small, so it's untouched, same 492 rows, same
+columns, just copied in.
+
+WHERE IT'S USED:
+  - Meltano tap-csv entity "org_units" -> lands in Postgres
+  - dbt model stg_org_units.sql (staging)
+  - dbt model dim_geography.sql (the authoritative region/zone/woreda/PHCU
+    hierarchy — used instead of the MFR's own region/zone fields because
+    the DHIS2 tree is cleaner)
+  - spark_link_compare.py (right side of the join)
+  - This is the file that gets joined against dataset #1 on the real shared
+    key: org_units.id == master_facility_registry.dhis2_id
+
+
+3. facility_linkage_unresolved.csv  (152 rows)
+-------------------------------------------------
+SOURCE: derived from #1 and #2 together, not a separate upload.
+
+WHAT I DID: took org_units.csv (492 rows) and kept only the rows whose id
+does NOT appear anywhere in master_facility_registry.csv's dhis2_id column.
+That's 152 org units — real places that exist in the DHIS2 hierarchy but
+have no matching MFR record on the shared id. Kept just the identifying
+columns (id, name, shortname, level, and the l1name–l6name hierarchy names).
+
+WHERE IT'S USED:
+  - dbt model fact_linkage_audit.sql reports this count (152 unresolved out
+    of 492 total = the 69% match rate number)
+  - spark_link_compare.py writes this same set to MinIO silver-zone as
+    parquet (the "left" side of the join with no match)
+  - llm_examples/llm_facility_matching.py reads this file directly — these
+    are the org units it tries to resolve by name instead of by id
+
+
+4. dhis2_manual_registry_fafan.csv  (461 rows)
+--------------------------------------------------
+SOURCE: dhis2_echis_mfr_facilities__1_.xlsx, sheet "dhis2" specifically
+(not the "mfr" or "echis" sheets).
+
+WHAT I DID: that sheet has 37,178 rows nationwide, one row per facility as
+recorded by a separately, manually maintained DHIS2 regional bureau list
+(different from the org_units.csv export — no shared id between them).
+Filtered to zonal == "Fafan ZHD" only, kept all 9 original columns
+(uid, regional, zonal, wereda, phcu, name, facilitytype, ownership, level).
+
+WHERE IT'S USED:
+  - llm_examples/llm_facility_matching.py — this is the candidate pool the
+    script searches for each of the 152 unresolved org units. It pre-filters
+    to the top 3 closest names by plain string similarity, then asks Gemini
+    to judge whether each candidate is actually the same real facility as
+    the unresolved org unit, given both names and their region.
+
+
+5. master_facility_registry_clean.csv / org_units_clean.csv
+---------------------------------------------------------------
+SOURCE: #1 and #2, run through data_cleaning/clean_facility_data.py.
+
+WHAT I DID (real, measured, logged in DATA_CLEANING_LOG.md): trimmed
+whitespace, fixed facility names that started with a lowercase letter,
+added a zone_normalized column so "Fafan" (MFR) and "Fafan Zone" (DHIS2)
+can be matched by name and not just by id, nulled coordinates that fell
+outside Ethiopia's actual bounding box, converted year_opened from the
+Ethiopian calendar to a plain Gregorian year, and added a beds_reported
+flag so "not reported" and "actually zero" don't get silently merged.
+
+WHERE IT'S USED: these _clean.csv files are what actually gets ingested —
+Meltano, dbt, Spark, and the ClickHouse load all point at these, not at
+the raw #1/#2 files directly. Cleaning runs before ingestion on purpose:
+a join is only as good as the keys and names going into it.
+
+
+THE JOIN, IN ONE LINE
+----------------------
+master_facility_registry.dhis2_id  ==  org_units.id
+  -> 340 matched automatically (real shared key, no guessing)
+  -> 152 left over -> facility_linkage_unresolved.csv
+       -> matched by name against dhis2_manual_registry_fafan.csv using an
+          LLM, since there's no shared id left to join on

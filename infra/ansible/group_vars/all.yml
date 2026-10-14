@@ -1,0 +1,6 @@
+# real deployments: encrypt this file with `ansible-vault encrypt`.
+# left plain here since it's a documentation example, not live secrets.
+postgres_password: "{{ vault_postgres_password | default('change_me') }}"
+clickhouse_password: "{{ vault_clickhouse_password | default('change_me') }}"
+minio_root_password: "{{ vault_minio_password | default('change_me') }}"
+nhdw_data_dir: /opt/nhdw/data_v2

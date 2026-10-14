@@ -1,0 +1,6 @@
+apiVersion: v2
+name: nhdw
+description: National Health Data Warehouse -- ETL/ELT, warehouse, BI, monitoring, and auth as one deployable chart
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

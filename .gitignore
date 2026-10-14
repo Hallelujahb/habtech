@@ -1,0 +1,14 @@
+CREDENTIALS.md
+.env
+*.env
+**/.env
+dbt_venv/
+dbt_python_venv/
+**/venv/
+**/.venv/
+__pycache__/
+*.pyc
+**/target/
+**/logs/
+**/dbt_packages/
+.DS_Store

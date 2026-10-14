@@ -1,0 +1,8 @@
+name: 'nhdw_demo_python'
+version: '1.0.0'
+config-version: 2
+profile: 'nhdw_demo_python'
+model-paths: ["models"]
+models:
+  nhdw_demo_python:
+    +materialized: table
